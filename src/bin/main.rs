@@ -14,8 +14,8 @@ use core::task::Poll;
 
 use defmt::{error, info};
 use embassy_executor::Spawner;
-use embassy_executor::raw::Executor;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Ticker, Timer};
 use esp_hal::clock::CpuClock;
@@ -23,6 +23,7 @@ use esp_hal::rng::{Rng, Trng, TrngSource};
 use esp_hal::system::{CpuControl, Stack};
 use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
+use esp_rtos::embassy::Executor;
 use static_cell::StaticCell;
 
 #[panic_handler]
@@ -48,7 +49,11 @@ struct VehicleState {
     motors_on: bool,
 }
 
-#[derive(Clone, Copy)]
+const VS_QUEUE_SIZE: usize = 5;
+static VEHICLE_QUEUE: Channel<CriticalSectionRawMutex, VehicleState, VS_QUEUE_SIZE> =
+    Channel::new();
+
+#[derive(Clone, Copy, defmt::Format)]
 struct Command {
     steer: i16,
     throttle: i16,
@@ -125,14 +130,12 @@ async fn main(spawner: Spawner) -> ! {
 
     info!("Embassy initialized!");
 
-    // Access core2
-    let mut cpu_ctrl = CpuControl::new(peripherals.CPU_CTRL);
+    // Access core1
     let stack = CORE1_STACK.init(Stack::new());
 
-    let _guard = cpu_ctrl.start_app_core(stack, move || {});
+    let core1_sw_intr = sw_interrupt.software_interrupt1;
+    esp_rtos::start_second_core(peripherals.CPU_CTRL, core1_sw_intr, stack, core1_main);
 
-    spawner.spawn(speed_sensor().unwrap());
-    spawner.spawn(control_loop().unwrap());
     spawner.spawn(cmd_generator().unwrap());
 
     loop {
@@ -143,12 +146,27 @@ async fn main(spawner: Spawner) -> ! {
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.1.0/examples
 }
 
+fn core1_main() {
+    let executor_1 = EXECUTOR_C1.init(Executor::new());
+    executor_1.run(|spawner| {
+        spawner.spawn(control_loop().unwrap());
+        spawner.spawn(speed_sensor().unwrap());
+    })
+}
+
 #[embassy_executor::task]
 async fn control_loop() {
     let mut ticker = Ticker::every(Duration::from_millis(50));
     loop {
         let cmd = CMD_CORE.wait().await;
         let _ = apply_speed(cmd.throttle);
+        let speed = WHEEL_SPEED.load(core::sync::atomic::Ordering::Relaxed);
+        let vs = VehicleState {
+            steer: 0,
+            speed_mm_s: speed,
+            motors_on: true,
+        };
+        VEHICLE_QUEUE.send(vs).await;
         ticker.next().await
     }
 }
@@ -174,15 +192,20 @@ async fn speed_sensor() {
 
 #[embassy_executor::task]
 async fn cmd_generator() {
+    let mut ticker = Ticker::every(Duration::from_millis(200));
     let rng = Rng::new();
-    let t_rand = rng.random();
-    let (t_min, t_max) = (0, 100);
-    let (s_min, s_max) = (-15, 15);
-    let cmd = Command {
-        throttle: random_calc(t_rand, t_min, t_max),
-        steer: random_calc(t_rand, s_min, s_max),
-    };
-    CMD_CORE.signal(cmd);
+    loop {
+        let t_rand = rng.random();
+        let (t_min, t_max) = (-20, 20); // inc or dec max 20
+        let (s_min, s_max) = (-15, 15);
+        let cmd = Command {
+            throttle: random_calc(t_rand, t_min, t_max),
+            steer: random_calc(t_rand, s_min, s_max),
+        };
+        defmt::info!("cmd: {:#?}", cmd);
+        CMD_CORE.signal(cmd);
+        ticker.next().await
+    }
 }
 
 fn random_calc(r: u32, min: i16, max: i16) -> i16 {
