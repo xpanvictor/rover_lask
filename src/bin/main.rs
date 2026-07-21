@@ -131,9 +131,9 @@ async fn main(spawner: Spawner) -> ! {
 
     let _guard = cpu_ctrl.start_app_core(stack, move || {});
 
-    // TODO: Spawn some tasks
     spawner.spawn(speed_sensor().unwrap());
     spawner.spawn(control_loop().unwrap());
+    spawner.spawn(cmd_generator().unwrap());
 
     loop {
         info!("Hello world!");
