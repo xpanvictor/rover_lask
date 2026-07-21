@@ -1273,6 +1273,7 @@ dependencies = [
  "defmt 1.1.1",
  "embassy-executor",
  "embassy-futures",
+ "embassy-sync 0.8.0",
  "embassy-time",
  "esp-bootloader-esp-idf",
  "esp-hal",

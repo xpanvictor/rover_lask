@@ -7,6 +7,7 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
+use core::ops::Add;
 use core::pin::Pin;
 use core::sync::atomic::AtomicU32;
 use core::task::Poll;
@@ -14,8 +15,11 @@ use core::task::Poll;
 use defmt::{error, info};
 use embassy_executor::Spawner;
 use embassy_executor::raw::Executor;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Ticker, Timer};
 use esp_hal::clock::CpuClock;
+use esp_hal::rng::{Rng, Trng, TrngSource};
 use esp_hal::system::{CpuControl, Stack};
 use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
@@ -49,6 +53,9 @@ struct Command {
     steer: i16,
     throttle: i16,
 }
+
+// command signal
+static CMD_CORE: Signal<CriticalSectionRawMutex, Command> = Signal::new();
 
 struct DelayMS {
     ms: u64,
@@ -92,12 +99,12 @@ impl Future for DelayMS {
     }
 }
 
-macro_rules! mk_static {
-    ($t:ty, $val:expr) => {{
-        static CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
-        CELL.uninit().write($val)
-    }};
-}
+// macro_rules! mk_static {
+//     ($t:ty, $val:expr) => {{
+//         static CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+//         CELL.uninit().write($val)
+//     }};
+// }
 
 #[allow(
     clippy::large_stack_frames,
@@ -121,7 +128,6 @@ async fn main(spawner: Spawner) -> ! {
     // Access core2
     let mut cpu_ctrl = CpuControl::new(peripherals.CPU_CTRL);
     let stack = CORE1_STACK.init(Stack::new());
-    let c1_executor = EXECUTOR_C1.init();
 
     let _guard = cpu_ctrl.start_app_core(stack, move || {});
 
@@ -141,19 +147,45 @@ async fn main(spawner: Spawner) -> ! {
 async fn control_loop() {
     let mut ticker = Ticker::every(Duration::from_millis(50));
     loop {
-        let speed = WHEEL_SPEED.load(core::sync::atomic::Ordering::Relaxed);
-        defmt::info!("speed: {}", speed);
+        let cmd = CMD_CORE.wait().await;
+        let _ = apply_speed(cmd.throttle);
         ticker.next().await
     }
 }
 
+fn apply_speed(speed: i16) -> u32 {
+    WHEEL_SPEED.update(
+        core::sync::atomic::Ordering::SeqCst,
+        core::sync::atomic::Ordering::SeqCst,
+        |sp| 0.max(speed.add(sp as i16) as u32).min(100),
+    );
+    WHEEL_SPEED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 #[embassy_executor::task]
 async fn speed_sensor() {
-    let mut counter = 0;
     loop {
         DelayMS::new(20).await;
-        WHEEL_SPEED.store(counter, core::sync::atomic::Ordering::Relaxed);
-        counter += 1;
+        let speed = WHEEL_SPEED.load(core::sync::atomic::Ordering::Relaxed);
+        defmt::info!("speed: {}", speed);
         embassy_futures::yield_now().await;
     }
+}
+
+#[embassy_executor::task]
+async fn cmd_generator() {
+    let rng = Rng::new();
+    let t_rand = rng.random();
+    let (t_min, t_max) = (0, 100);
+    let (s_min, s_max) = (-15, 15);
+    let cmd = Command {
+        throttle: random_calc(t_rand, t_min, t_max),
+        steer: random_calc(t_rand, s_min, s_max),
+    };
+    CMD_CORE.signal(cmd);
+}
+
+fn random_calc(r: u32, min: i16, max: i16) -> i16 {
+    let delta = max - min;
+    min + (r % delta as u32) as i16
 }
