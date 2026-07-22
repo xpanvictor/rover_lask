@@ -16,6 +16,7 @@ use defmt::{error, info};
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_sync::pubsub::{PubSubChannel, WaitResult};
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Ticker, Timer};
 use esp_hal::clock::CpuClock;
@@ -49,9 +50,27 @@ struct VehicleState {
     motors_on: bool,
 }
 
-const VS_QUEUE_SIZE: usize = 5;
-static VEHICLE_QUEUE: Channel<CriticalSectionRawMutex, VehicleState, VS_QUEUE_SIZE> =
-    Channel::new();
+trait QueueConfig {
+    const MAX_SUBS: usize;
+    const CAPACITY: usize;
+    const PUBLISHERS: usize;
+}
+
+// 2. Create a type to represent your settings
+struct VehicleQueueSettings;
+
+impl QueueConfig for VehicleQueueSettings {
+    const MAX_SUBS: usize = 2;
+    const CAPACITY: usize = 4;
+    const PUBLISHERS: usize = 1;
+}
+static VEHICLE_STATE_CH: PubSubChannel<
+    CriticalSectionRawMutex,
+    VehicleState,
+    { VehicleQueueSettings::MAX_SUBS },
+    { VehicleQueueSettings::CAPACITY },
+    { VehicleQueueSettings::PUBLISHERS },
+> = PubSubChannel::new();
 
 #[derive(Clone, Copy, defmt::Format)]
 struct Command {
@@ -137,6 +156,8 @@ async fn main(spawner: Spawner) -> ! {
     esp_rtos::start_second_core(peripherals.CPU_CTRL, core1_sw_intr, stack, core1_main);
 
     spawner.spawn(cmd_generator().unwrap());
+    spawner.spawn(display().unwrap());
+    spawner.spawn(telemetry().unwrap());
 
     loop {
         info!("Hello world!");
@@ -157,8 +178,10 @@ fn core1_main() {
 #[embassy_executor::task]
 async fn control_loop() {
     let mut ticker = Ticker::every(Duration::from_millis(50));
+    let vs_pub = VEHICLE_STATE_CH.publisher().unwrap();
     loop {
         let cmd = CMD_CORE.wait().await;
+        defmt::info!("fetched cmd: {:?}", cmd);
         let _ = apply_speed(cmd.throttle);
         let speed = WHEEL_SPEED.load(core::sync::atomic::Ordering::Relaxed);
         let vs = VehicleState {
@@ -166,7 +189,7 @@ async fn control_loop() {
             speed_mm_s: speed,
             motors_on: true,
         };
-        VEHICLE_QUEUE.send(vs).await;
+        vs_pub.publish(vs).await;
         ticker.next().await
     }
 }
@@ -178,6 +201,28 @@ fn apply_speed(speed: i16) -> u32 {
         |sp| 0.max(speed.add(sp as i16) as u32).min(100),
     );
     WHEEL_SPEED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[embassy_executor::task]
+async fn display() {
+    let mut vs_sub = VEHICLE_STATE_CH.subscriber().unwrap();
+    let vs_a = vs_sub.next_message().await;
+    if let WaitResult::Message(vs) = vs_a {
+        defmt::info!("Display => Speed: {} Steer: {}", vs.speed_mm_s, vs.steer);
+    };
+}
+
+#[embassy_executor::task]
+async fn telemetry() {
+    let mut vs_sub = VEHICLE_STATE_CH.subscriber().unwrap();
+    let vs_a = vs_sub.next_message().await;
+    if let WaitResult::Message(vs) = vs_a {
+        defmt::info!(
+            "Telemetry => [Log] Speed: {} Steer: {}",
+            vs.speed_mm_s,
+            vs.steer
+        );
+    };
 }
 
 #[embassy_executor::task]
@@ -202,7 +247,6 @@ async fn cmd_generator() {
             throttle: random_calc(t_rand, t_min, t_max),
             steer: random_calc(t_rand, s_min, s_max),
         };
-        defmt::info!("cmd: {:#?}", cmd);
         CMD_CORE.signal(cmd);
         ticker.next().await
     }
