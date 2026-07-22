@@ -9,7 +9,7 @@
 
 use core::ops::Add;
 use core::pin::Pin;
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicBool, AtomicU32};
 use core::task::Poll;
 
 use defmt::{error, info};
@@ -42,6 +42,8 @@ static CORE1_STACK: StaticCell<Stack<65536>> = StaticCell::new();
 static EXECUTOR_C1: StaticCell<Executor> = StaticCell::new();
 
 static WHEEL_SPEED: AtomicU32 = AtomicU32::new(0);
+static MOTOR_DRIVER: AtomicU32 = AtomicU32::new(0);
+static MOTOR_ENABLE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 struct VehicleState {
@@ -180,6 +182,7 @@ async fn control_loop() {
     let mut ticker = Ticker::every(Duration::from_millis(50));
     let vs_pub = VEHICLE_STATE_CH.publisher().unwrap();
     loop {
+        ticker.next().await;
         let cmd = CMD_CORE.wait().await;
         defmt::info!("fetched cmd: {:?}", cmd);
         let _ = apply_speed(cmd.throttle);
@@ -190,7 +193,6 @@ async fn control_loop() {
             motors_on: true,
         };
         vs_pub.publish(vs).await;
-        ticker.next().await
     }
 }
 
